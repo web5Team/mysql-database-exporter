@@ -120,6 +120,35 @@ function makeMySQL8Compatible(sql) {
   return sql;
 }
 
+// 获取表的字段信息和类型
+async function getTableColumns(connection, tableName) {
+  try {
+    const [columns] = await connection.query(`
+      SELECT 
+        COLUMN_NAME, 
+        DATA_TYPE,
+        COLUMN_TYPE
+      FROM INFORMATION_SCHEMA.COLUMNS 
+      WHERE TABLE_SCHEMA = ? 
+      AND TABLE_NAME = ?
+    `, [dbConfig.database, tableName]);
+    
+    // 转换为字段名 -> 类型的映射
+    const columnTypes = {};
+    columns.forEach(col => {
+      columnTypes[col.COLUMN_NAME] = {
+        dataType: col.DATA_TYPE,
+        columnType: col.COLUMN_TYPE
+      };
+    });
+    
+    return columnTypes;
+  } catch (error) {
+    console.error(`Error getting column types for table ${tableName}:`, error.message);
+    return {};
+  }
+}
+
 async function getTableStructure(connection, tableName) {
   try {
     const [rows] = await connection.query(`SHOW CREATE TABLE ${tableName}`);
@@ -271,19 +300,76 @@ async function getTableDataInBatches(connection, tableName) {
   }
 }
 
-function generateInsertStatements(tableName, data) {
+// 处理特殊数据类型值
+function formatValueByType(value, columnType) {
+  if (value === null) return 'NULL';
+  
+  const { dataType } = columnType;
+  
+  switch (dataType.toLowerCase()) {
+    case 'json':
+      // 处理 JSON 类型
+      return `'${JSON.stringify(value).replace(/'/g, "''")}'`;
+    
+    case 'blob':
+    case 'binary':
+    case 'varbinary':
+    case 'tinyblob':
+    case 'mediumblob':
+    case 'longblob':
+      // 处理二进制类型，转为十六进制
+      if (Buffer.isBuffer(value)) {
+        return `0x${value.toString('hex')}`;
+      }
+      return `'${value.toString().replace(/'/g, "''")}'`;
+    
+    case 'bit':
+      // 处理位类型
+      return value.toString('hex');
+    
+    case 'timestamp':
+    case 'datetime':
+    case 'date':
+      // 处理日期类型
+      if (value instanceof Date) {
+        return `'${value.toISOString().slice(0, 19).replace('T', ' ')}'`;
+      }
+      return `'${value}'`;
+    
+    case 'char':
+    case 'varchar':
+    case 'text':
+    case 'tinytext':
+    case 'mediumtext':
+    case 'longtext':
+    case 'enum':
+    case 'set':
+      // 处理字符串类型
+      return `'${value.toString().replace(/'/g, "''")}'`;
+    
+    default:
+      // 处理数字和其他类型
+      if (typeof value === 'string') {
+        return `'${value.replace(/'/g, "''")}'`;
+      }
+      if (typeof value === 'object' && value instanceof Date) {
+        return `'${value.toISOString().slice(0, 19).replace('T', ' ')}'`;
+      }
+      return value;
+  }
+}
+
+async function generateInsertStatements(tableName, data, connection) {
   if (!data || data.length === 0) return '';
+  
+  // 获取表的字段类型信息
+  const columnTypes = await getTableColumns(connection, tableName);
   
   const columns = Object.keys(data[0]);
   const values = data.map(row => {
     return `(${columns.map(col => {
       const value = row[col];
-      if (value === null) return 'NULL';
-      if (typeof value === 'string') return `'${value.replace(/'/g, "''")}'`;
-      if (typeof value === 'object' && value instanceof Date) {
-        return `'${value.toISOString().slice(0, 19).replace('T', ' ')}'`;
-      }
-      return value;
+      return formatValueByType(value, columnTypes[col] || { dataType: 'unknown' });
     }).join(', ')})`;
   });
 
@@ -339,7 +425,9 @@ async function exportDatabase() {
     
     // 添加 MySQL 8.0 兼容性设置
     sqlContent += `SET NAMES utf8mb4;\n`;
-    sqlContent += `SET FOREIGN_KEY_CHECKS=0;\n\n`;
+    sqlContent += `SET FOREIGN_KEY_CHECKS=0;\n`;
+    sqlContent += `SET SQL_MODE = "NO_AUTO_VALUE_ON_ZERO";\n`;
+    sqlContent += `SET time_zone = "+00:00";\n\n`;
 
     // 遍历每个表
     for (const table of tables) {
@@ -358,7 +446,7 @@ async function exportDatabase() {
         if (data.length > 0) {
           console.log(`Exporting ${data.length} rows from table ${tableName}`);
           sqlContent += `-- Data for table \`${tableName}\`\n`;
-          sqlContent += generateInsertStatements(tableName, data);
+          sqlContent += await generateInsertStatements(tableName, data, connection);
         } else {
           console.log(`No data in table ${tableName}`);
         }
