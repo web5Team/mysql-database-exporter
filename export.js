@@ -29,7 +29,9 @@ const exportConfig = {
   // 时间范围配置
   useTimeRange: process.env.USE_TIME_RANGE === 'true',
   startTime: process.env.START_TIME,
-  endTime: process.env.END_TIME
+  endTime: process.env.END_TIME,
+  // 小表处理配置
+  smallTableThreshold: parseInt(process.env.SMALL_TABLE_THRESHOLD || '10000')
 };
 
 // 打印数据库配置信息（隐藏密码）
@@ -57,6 +59,7 @@ if (exportConfig.useTimeRange) {
   console.log(`开始时间: ${exportConfig.startTime}`);
   console.log(`结束时间: ${exportConfig.endTime}`);
 }
+console.log(`小表全部导出阈值: ${exportConfig.smallTableThreshold} 条记录`);
 console.log('=====================\n');
 
 // 获取数据库版本信息
@@ -224,6 +227,22 @@ async function getTableData(connection, tableName) {
 
 async function getTableDataInBatches(connection, tableName) {
   try {
+    // 首先获取表的总记录数
+    const [countResult] = await connection.query(`SELECT COUNT(*) as total FROM ${tableName}`);
+    const totalRows = countResult[0].total;
+    
+    console.log(`表 ${tableName} 总记录数: ${totalRows}`);
+    
+    // 如果记录数少于小表阈值，则全部导出
+    const isSmallTable = totalRows < exportConfig.smallTableThreshold;
+    if (isSmallTable && exportConfig.smallTableThreshold > 0) {
+      console.log(`表 ${tableName} 记录数少于 ${exportConfig.smallTableThreshold}，将全部导出`);
+      
+      const [rows] = await connection.query(`SELECT * FROM ${tableName}`);
+      return rows;
+    }
+    
+    // 否则应用筛选条件
     let query = `SELECT * FROM ${tableName}`;
     const params = [];
     let whereClause = '';
@@ -267,12 +286,14 @@ async function getTableDataInBatches(connection, tableName) {
       }
     }
 
-    // 获取总记录数
-    const countQuery = `SELECT COUNT(*) as total FROM ${tableName}${whereClause}`;
-    const [countResult] = await connection.query(countQuery, params);
-    const totalRows = countResult[0].total;
+    // 获取筛选后的总记录数
+    const filteredCountQuery = `SELECT COUNT(*) as total FROM ${tableName}${whereClause}`;
+    const [filteredCountResult] = await connection.query(filteredCountQuery, params);
+    const filteredTotalRows = filteredCountResult[0].total;
 
-    console.log(`表 ${tableName} 总记录数: ${totalRows}`);
+    if (whereClause) {
+      console.log(`表 ${tableName} 筛选后的记录数: ${filteredTotalRows}`);
+    }
 
     // 分批处理数据
     const batches = [];
@@ -281,11 +302,11 @@ async function getTableDataInBatches(connection, tableName) {
       Math.min(exportConfig.maxRowsPerTable, exportConfig.batchSize) : 
       exportConfig.batchSize;
 
-    while (offset < totalRows && (exportConfig.maxRowsPerTable === 0 || offset < exportConfig.maxRowsPerTable)) {
+    while (offset < filteredTotalRows && (exportConfig.maxRowsPerTable === 0 || offset < exportConfig.maxRowsPerTable)) {
       const batchQuery = `${query}${whereClause} LIMIT ? OFFSET ?`;
       const batchParams = [...params, limit, offset];
       
-      console.log(`处理表 ${tableName} 的第 ${offset + 1} 到 ${Math.min(offset + limit, totalRows)} 条记录`);
+      console.log(`处理表 ${tableName} 的第 ${offset + 1} 到 ${Math.min(offset + limit, filteredTotalRows)} 条记录`);
       
       const [rows] = await connection.query(batchQuery, batchParams);
       batches.push(rows);
